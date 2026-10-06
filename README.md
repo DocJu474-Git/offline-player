@@ -21,8 +21,9 @@ nur die Installation als App (siehe unten) ist dann nicht möglich.
    Beim ersten Start muss der Server (`start.cmd`) laufen, danach wird die App
    auch ohne Server aus dem Cache geladen.
 
-Auf dem Handy: Ordner auf einen Webspace oder ins Heimnetz legen, Seite im Browser
-öffnen und „Zum Startbildschirm hinzufügen“ wählen.
+Auf dem Handy: https://docju474-git.github.io/offline-player/ im Browser öffnen
+und „Zum Startbildschirm hinzufügen“ bzw. „App installieren“ wählen. Danach läuft
+die App auch ohne Internet.
 
 ## Bedienung
 
