@@ -2,7 +2,7 @@
 <html lang="de">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
 <title>Offline Player</title>
 <meta name="description" content="Offline MP3-Player mit Import, Playlists und Sprungtasten.">
 <meta name="theme-color" content="#0f1115">
@@ -117,7 +117,9 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
 #menu button{display:block;width:100%;text-align:left;padding:10px 12px;border-radius:8px}
 #menu button:hover{background:var(--panel2)}
 #menu button.danger{color:var(--danger)}
-dialog{background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:16px;padding:18px;width:min(92vw,420px);max-height:85vh}
+dialog{background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:16px;padding:18px;width:min(92vw,420px);max-height:85vh;overflow:auto}
+@media (max-width:600px),(max-height:600px){dialog{margin:4vh auto auto}}
+dialog .list{max-height:min(50vh,360px)}
 dialog::backdrop{background:rgba(0,0,0,.5)}
 dialog h3{margin:0 0 12px;font-size:17px}
 dialog .actions{display:flex;justify-content:flex-end;gap:8px;margin-top:14px}
@@ -154,11 +156,13 @@ dialog .list .ls{font-size:12px;color:var(--muted)}
 <main>
   <section id="view-library">
     <div class="toolbar">
-      <label class="btn primary">
+      <button class="btn primary" id="importBtn">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M11 5h2v8.2l2.6-2.6 1.4 1.4-5 5-5-5 1.4-1.4L11 13.2zM5 18h14v2H5z"/></svg>
-        Importieren
-        <input type="file" id="fileInput" accept="audio/*,.mp3,.m4a,.aac,.ogg,.oga,.opus,.wav,.flac,.webm" multiple hidden>
-      </label>
+        Importieren ▾
+      </button>
+      <input type="file" id="fileInput" accept="audio/*,.mp3,.m4a,.m4b,.aac,.ogg,.oga,.opus,.wav,.flac,.webm,.wma,.aif,.aiff" multiple hidden>
+      <input type="file" id="dirInput" webkitdirectory multiple hidden>
+      <input type="file" id="anyInput" multiple hidden>
       <input type="search" id="search" class="search" placeholder="Suchen…" autocomplete="off">
     </div>
     <div id="progress"><span id="progressText"></span><div class="bar"><i id="progressBar"></i></div></div>
@@ -234,10 +238,8 @@ dialog .list .ls{font-size:12px;color:var(--muted)}
 
 <dialog id="promptDialog">
   <h3 id="promptTitle">Name</h3>
-  <form method="dialog">
-    <input type="text" id="promptInput" autocomplete="off" maxlength="80">
-    <div class="actions"><button class="btn" type="button" id="promptCancel">Abbrechen</button><button class="btn primary" id="promptOk">OK</button></div>
-  </form>
+  <input type="text" id="promptInput" autocomplete="off" maxlength="80" enterkeyhint="done">
+  <div class="actions"><button class="btn" type="button" id="promptCancel">Abbrechen</button><button class="btn primary" type="button" id="promptOk">OK</button></div>
 </dialog>
 
 <dialog id="pickDialog">
@@ -369,17 +371,22 @@ async function readTags(file) {
 
 /* ---------- Duration measurement (background) ---------- */
 const durQueue = []; let durBusy = false;
+const probe = new Audio(); probe.preload = 'metadata'; probe.muted = true;
 function getDuration(blob) {
-  return new Promise((res, rej) => {
-    const a = new Audio(); const url = URL.createObjectURL(blob);
+  return new Promise((res) => {
+    const a = probe; const url = URL.createObjectURL(blob);
     let finished = false;
-    const finish = v => { if (finished) return; finished = true; URL.revokeObjectURL(url); a.removeAttribute('src'); res(v); };
-    a.preload = 'metadata';
+    const finish = v => {
+      if (finished) return; finished = true; clearTimeout(timer);
+      a.onloadedmetadata = a.ondurationchange = a.onerror = null;
+      a.removeAttribute('src'); a.load(); URL.revokeObjectURL(url); res(v);
+    };
+    const timer = setTimeout(() => finish(isFinite(a.duration) ? a.duration : 0), 8000);
     a.onloadedmetadata = () => {
-      if (a.duration === Infinity || isNaN(a.duration)) { a.currentTime = 1e101; a.ondurationchange = () => { if (isFinite(a.duration)) finish(a.duration); }; setTimeout(() => finish(isFinite(a.duration) ? a.duration : 0), 3000); }
+      if (a.duration === Infinity || isNaN(a.duration)) { a.ondurationchange = () => { if (isFinite(a.duration)) finish(a.duration); }; try { a.currentTime = 1e101; } catch {} }
       else finish(a.duration);
     };
-    a.onerror = () => { if (finished) return; finished = true; URL.revokeObjectURL(url); rej(new Error('decode')); };
+    a.onerror = () => finish(0);
     a.src = url;
   });
 }
@@ -397,14 +404,18 @@ async function runDurations() {
 
 /* ---------- Import ---------- */
 const AUDIO_RE = /^audio\/|\.(mp3|m4a|m4b|aac|ogg|oga|opus|wav|flac|webm|wma|aif|aiff)$/i;
-async function importFiles(fileList) {
-  const files = [...fileList].filter(f => AUDIO_RE.test(f.type) || AUDIO_RE.test(f.name));
-  if (!files.length) { toast('Keine Audiodateien gefunden'); return; }
+let importing = false;
+async function importFiles(fileList, opts = {}) {
+  const all = [...fileList];
+  const files = opts.any ? all : all.filter(f => AUDIO_RE.test(f.type) || AUDIO_RE.test(f.name));
+  if (!files.length) { toast(all.length ? 'Keine Audiodateien dabei (Tipp: „Alle Dateitypen“)' : 'Keine Dateien ausgewählt'); return; }
+  if (importing) { toast('Import läuft noch'); return; }
+  importing = true;
   const prog = $('#progress'); prog.style.display = 'block';
-  let n = 0, failed = 0;
+  let n = 0, failed = 0, quota = false;
   for (const f of files) {
-    $('#progressText').textContent = `Importiere ${n + 1} von ${files.length}: ${f.name}`;
-    $('#progressBar').style.width = (n / files.length * 100) + '%';
+    const done = n + failed;
+    if (done % 10 === 0 || files.length < 30) { $('#progressText').textContent = `Importiere ${done + 1} von ${files.length}: ${f.name}`; $('#progressBar').style.width = (done / files.length * 100) + '%'; await new Promise(r => setTimeout(r, 0)); }
     try {
       const id = uid();
       const tags = await readTags(f);
@@ -414,12 +425,30 @@ async function importFiles(fileList) {
       state.tracks.set(id, meta);
       queueDuration(id, f);
       n++;
-    } catch (e) { console.error('Import fehlgeschlagen', f.name, e); failed++; }
-    if (n % 5 === 0) renderLibrary();
+    } catch (e) {
+      console.error('Import fehlgeschlagen', f.name, e); failed++;
+      if (e && (e.name === 'QuotaExceededError' || /quota/i.test(String(e.message || e.name)))) { quota = true; break; }
+    }
+    if (n % 25 === 0) renderLibrary();
   }
+  importing = false;
   prog.style.display = 'none';
   renderLibrary(); updateStats();
-  toast(failed ? `${n} importiert, ${failed} fehlgeschlagen` : `${n} Titel importiert`);
+  if (quota) toast(`Speicher voll: ${n} importiert, Rest abgebrochen. Platz freigeben oder Titel löschen.`);
+  else toast(failed ? `${n} importiert, ${failed} fehlgeschlagen` : `${n} Titel importiert`);
+}
+async function collectDropped(dt) {
+  const items = dt.items ? [...dt.items] : [];
+  const entries = items.map(i => i.webkitGetAsEntry && i.webkitGetAsEntry()).filter(Boolean);
+  if (!entries.length) return [...dt.files];
+  const out = [];
+  const readDir = reader => new Promise(res => { const acc = []; const step = () => reader.readEntries(es => { if (!es.length) return res(acc); acc.push(...es); step(); }, () => res(acc)); step(); });
+  const walk = async entry => {
+    if (entry.isFile) { await new Promise(res => entry.file(f => { out.push(f); res(); }, res)); }
+    else if (entry.isDirectory) { const es = await readDir(entry.createReader()); for (const e of es) await walk(e); }
+  };
+  for (const e of entries) await walk(e);
+  return out;
 }
 window.importFiles = importFiles;
 
@@ -469,9 +498,15 @@ function syncQueueFromPlaylist(pl) {
 }
 
 /* ---------- Rendering ---------- */
+const fmtBytes = b => b >= 1e9 ? (b / 1e9).toFixed(1) + ' GB' : Math.round(b / 1e6) + ' MB';
+let storageInfo = '';
 function updateStats() {
-  const n = state.tracks.size; let total = 0; for (const t of state.tracks.values()) total += t.duration || 0;
-  $('#stats').textContent = n ? `${n} Titel · ${fmt(total)}` : '';
+  const n = state.tracks.size; let total = 0, bytes = 0; for (const t of state.tracks.values()) { total += t.duration || 0; bytes += t.size || 0; }
+  const line = () => `${n} Titel · ${fmt(total)} · ${fmtBytes(bytes)}${storageInfo}`;
+  $('#stats').textContent = n ? line() : '';
+  if (navigator.storage && navigator.storage.estimate) navigator.storage.estimate().then(e => {
+    if (e && e.quota) { storageInfo = ` · frei ${fmtBytes(Math.max(0, e.quota - (e.usage || 0)))}`; if (n) $('#stats').textContent = line(); }
+  }).catch(() => {});
 }
 function libraryTracks() {
   const q = state.search.trim().toLowerCase();
@@ -712,23 +747,31 @@ function closeMenu() { menu.classList.remove('on'); }
 document.addEventListener('pointerdown', e => { if (!menu.contains(e.target)) closeMenu(); });
 window.addEventListener('resize', closeMenu); $('main').addEventListener('scroll', closeMenu);
 
+function openDialog(d, res, fallback) {
+  let settled = false;
+  const done = v => { if (settled) return; settled = true; d.onclose = null; if (d.open) d.close(); res(v); };
+  d.oncancel = e => { e.preventDefault(); done(fallback); };
+  d.onclose = () => done(fallback);
+  if (d.open) d.close();
+  d.showModal();
+  return done;
+}
 function confirmDialog(text) {
   return new Promise(res => {
     const d = $('#confirmDialog'); $('#confirmText').textContent = text;
-    const done = v => { d.close(); res(v); };
+    const done = openDialog(d, res, false);
     $('#confirmYes').onclick = () => done(true); $('#confirmNo').onclick = () => done(false);
-    d.oncancel = e => { e.preventDefault(); done(false); };
-    d.showModal();
   });
 }
 function promptName(title, value = '') {
   return new Promise(res => {
     const d = $('#promptDialog'); $('#promptTitle').textContent = title; const inp = $('#promptInput'); inp.value = value;
-    const done = v => { d.close(); res(v); };
-    d.querySelector('form').onsubmit = e => { e.preventDefault(); const v = inp.value.trim(); if (v) done(v); };
+    const done = openDialog(d, res, null);
+    const ok = () => { const v = inp.value.trim(); if (v) done(v); else inp.focus(); };
+    $('#promptOk').onclick = ok;
+    inp.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); ok(); } };
     $('#promptCancel').onclick = () => done(null);
-    d.oncancel = e => { e.preventDefault(); done(null); };
-    d.showModal(); inp.focus(); inp.select();
+    setTimeout(() => { inp.focus(); inp.select(); }, 30);
   });
 }
 function pickTracks(pl) {
@@ -742,28 +785,31 @@ function pickTracks(pl) {
     };
     list.onchange = e => { if (e.target.type === 'checkbox') { e.target.checked ? checked.add(e.target.value) : checked.delete(e.target.value); } };
     search.oninput = render; render();
-    const done = v => { d.close(); res(v); };
+    const done = openDialog(d, res, null);
     $('#pickOk').onclick = () => done([...checked]); $('#pickCancel').onclick = () => done(null);
-    d.oncancel = e => { e.preventDefault(); done(null); };
-    d.showModal();
   });
 }
 function pickPlaylist() {
   return new Promise(res => {
     const d = $('#plPickDialog'), list = $('#plPickList');
     list.innerHTML = state.playlists.length ? state.playlists.map(pl => `<label data-pl="${pl.id}"><span class="lt">${esc(pl.name)}<div class="ls">${pl.trackIds.length} Titel</div></span></label>`).join('') : '<div class="empty">Noch keine Listen.</div>';
-    const done = v => { d.close(); res(v); };
+    const done = openDialog(d, res, null);
     list.onclick = e => { const l = e.target.closest('label'); if (l) done(state.playlists.find(p => p.id === l.dataset.pl)); };
-    $('#plPickNew').onclick = async () => { d.close(); const name = await promptName('Neue Liste'); if (!name) return res(null); res(await createPlaylist(name)); };
+    $('#plPickNew').onclick = async () => { d.onclose = null; d.close(); const name = await promptName('Neue Liste'); if (!name) return done(null); done(await createPlaylist(name)); };
     $('#plPickCancel').onclick = () => done(null);
-    d.oncancel = e => { e.preventDefault(); done(null); };
-    d.showModal();
   });
 }
 
 /* ---------- Events ---------- */
 $$('.tabs button').forEach(b => b.onclick = () => showTab(b.dataset.tab));
 $('#fileInput').onchange = e => { importFiles(e.target.files); e.target.value = ''; };
+$('#dirInput').onchange = e => { importFiles(e.target.files); e.target.value = ''; };
+$('#anyInput').onchange = e => { importFiles(e.target.files, { any: true }); e.target.value = ''; };
+$('#importBtn').onclick = e => openMenu(e.currentTarget, [
+  { label: 'Audiodateien auswählen…', action: () => $('#fileInput').click() },
+  { label: 'Ganzen Ordner auswählen…', action: () => $('#dirInput').click() },
+  { label: 'Alle Dateitypen anzeigen…', action: () => $('#anyInput').click() },
+]);
 $('#search').oninput = e => { state.search = e.target.value; renderLibrary(); };
 
 $('#trackList').onclick = e => {
@@ -858,7 +904,7 @@ let dragDepth = 0;
 document.addEventListener('dragenter', e => { if ([...e.dataTransfer.types].includes('Files')) { dragDepth++; $('#dropOverlay').classList.add('on'); } });
 document.addEventListener('dragleave', () => { if (--dragDepth <= 0) { dragDepth = 0; $('#dropOverlay').classList.remove('on'); } });
 document.addEventListener('dragover', e => e.preventDefault());
-document.addEventListener('drop', e => { e.preventDefault(); dragDepth = 0; $('#dropOverlay').classList.remove('on'); if (e.dataTransfer.files.length) importFiles(e.dataTransfer.files); });
+document.addEventListener('drop', async e => { e.preventDefault(); dragDepth = 0; $('#dropOverlay').classList.remove('on'); const files = await collectDropped(e.dataTransfer); if (files.length) importFiles(files); });
 
 window.addEventListener('beforeunload', saveState);
 document.addEventListener('visibilitychange', () => { if (document.hidden) saveState(); });

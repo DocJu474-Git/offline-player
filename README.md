@@ -26,8 +26,10 @@ Auf dem Handy: Ordner auf einen Webspace oder ins Heimnetz legen, Seite im Brows
 
 ## Bedienung
 
-- **Importieren:** Button „Importieren“ oder Dateien ins Fenster ziehen.
+- **Importieren:** Button „Importieren“ → Audiodateien, ganzer Ordner oder alle Dateitypen.
+  Am PC auch Dateien oder Ordner ins Fenster ziehen.
   MP3, M4A, AAC, OGG, OPUS, WAV, FLAC. Titel/Interpret werden aus ID3-Tags gelesen.
+  Oben rechts steht, wie viel Speicher belegt und noch frei ist.
 - **Listen:** Tab „Listen“ → „+ Neue Liste“ → „Titel hinzufügen“.
   Über ⋯ an einem Titel: abspielen, verschieben, entfernen, in andere Liste kopieren.
 - **Player-Tasten:** Vorheriger Titel · −20 s · −10 s · Play/Pause · +10 s · +20 s · Nächster Titel.
