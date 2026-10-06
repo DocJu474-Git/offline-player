@@ -21,9 +21,8 @@ nur die Installation als App (siehe unten) ist dann nicht möglich.
    Beim ersten Start muss der Server (`start.cmd`) laufen, danach wird die App
    auch ohne Server aus dem Cache geladen.
 
-Auf dem Handy: https://docju474-git.github.io/offline-player/ im Browser öffnen
-und „Zum Startbildschirm hinzufügen“ bzw. „App installieren“ wählen. Danach läuft
-die App auch ohne Internet.
+Auf dem Handy: Ordner auf einen Webspace oder ins Heimnetz legen, Seite im Browser
+öffnen und „Zum Startbildschirm hinzufügen“ wählen.
 
 ## Bedienung
 
@@ -32,7 +31,8 @@ die App auch ohne Internet.
 - **Listen:** Tab „Listen“ → „+ Neue Liste“ → „Titel hinzufügen“.
   Über ⋯ an einem Titel: abspielen, verschieben, entfernen, in andere Liste kopieren.
 - **Player-Tasten:** Vorheriger Titel · −20 s · −10 s · Play/Pause · +10 s · +20 s · Nächster Titel.
-  Darunter Zufall, Wiederholen (alle / ein Titel) und Lautstärke.
+  Darunter Zufall, Wiederholen (alle / ein Titel), Stumm-Taste und Lautstärke.
+- **Hell / Dunkel:** Sonne-/Mond-Symbol oben rechts. Ohne Auswahl folgt die App dem System.
 - Der Player merkt sich Titel und Position beim Schließen.
 
 ## Tastatur
@@ -43,6 +43,7 @@ die App auch ohne Internet.
 | ← / → | 10 s zurück / vor |
 | Umschalt + ← / → | 20 s zurück / vor |
 | Strg + ← / → | vorheriger / nächster Titel |
+| M | Stumm an / aus |
 
 Die Sperrbildschirm- und Headset-Tasten (Play, Pause, nächster Titel, ±10 s)
 werden über die Media Session API unterstützt.
