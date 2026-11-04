@@ -1,0 +1,6 @@
+numpy>=1.26
+pandas>=2.1
+pyarrow>=14
+numba>=0.59
+matplotlib>=3.8
+databento>=0.40
