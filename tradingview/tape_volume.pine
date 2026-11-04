@@ -1,0 +1,460 @@
+//@version=6
+// Tape Volume - Pine-Script-Port des thinkScript-Studies "Tape Volume" v1.1
+// (Original: Logan Crist / BaconTrading, 2018, fuer 1-Tick-Charts in thinkorswim).
+//
+// Portierte Algorithmen (Abschnitt 7 des Originals):
+//   Cash Flow, Volume Momentum, Order Accumulation, Supply & Demand,
+//   Transaction Sentiment, Market Orders, Order Speed, Price Inertia.
+//
+// Datenquelle (Input "Datenquelle"):
+//   Auto                 -> Tick-Chart (1T/10T/...): jeder Chart-Bar ist ein Tick.
+//                           Zeit-Chart: Intrabars des Timeframes "Intrabar-Timeframe"
+//                           (Standard 1S), fehlen diese, wird der Chart-Bar als Tick verarbeitet.
+//   Chart-Bars als Ticks -> jeder Chart-Bar zaehlt als ein Tick (grob, geht in jedem Plan).
+//   Intrabars            -> nur Intrabars, ohne Intrabar-Daten keine Berechnung.
+//
+// Nicht portiert: die im Original selbst gezeichneten Volume-/Time-Bars und das
+// Uhr/Datum-Label. TradingView zeigt den Preis im Hauptchart, dieser Indikator
+// laeuft als Unterfenster mit Werten normiert auf -1..+1.
+indicator("Tape Volume (Port)", "TapeVol", overlay = false, max_bars_back = 500)
+
+// ----------------------------------------------------------------------------
+// Inputs
+// ----------------------------------------------------------------------------
+string A_TS  = "Transaction Sentiment"
+string A_CF  = "Cash Flow"
+string A_VM  = "Volume Momentum"
+string A_OA  = "Order Accumulation"
+string A_SD  = "Supply & Demand"
+string A_MO  = "Market Orders"
+string A_OS  = "Order Speed"
+string A_PI  = "Price Inertia"
+string A_OFF = "Aus"
+
+string algo1    = input.string(A_TS,  "Algorithmus 1", options = [A_TS, A_CF, A_VM, A_OA, A_SD, A_MO, A_OS, A_PI, A_OFF], group = "Algorithmen")
+string algo2    = input.string(A_OFF, "Algorithmus 2", options = [A_TS, A_CF, A_VM, A_OA, A_SD, A_MO, A_OS, A_PI, A_OFF], group = "Algorithmen")
+
+string M_AUTO   = "Auto"
+string M_CHART  = "Chart-Bars als Ticks"
+string M_LTF    = "Intrabars"
+string dataMode = input.string(M_AUTO, "Datenquelle", options = [M_AUTO, M_CHART, M_LTF], group = "Daten")
+string ltf      = input.timeframe("1S", "Intrabar-Timeframe (Zeit-Charts)", group = "Daten",
+     tooltip = "1S braucht mindestens Premium. Auf Tick-Charts wird dieser Wert ignoriert.")
+
+string S_RECENT = "Letzte Bars"
+string S_ALL    = "Alle Bars"
+string scaling  = input.string(S_RECENT, "Skalierung", options = [S_RECENT, S_ALL], group = "Darstellung")
+int    visLen   = input.int(900, "Sichtbare Bars fuer Skalierung", minval = 10, group = "Darstellung")
+bool   useStep  = input.bool(true, "Ausreisser-Filter (max. Schritt = 3x mittlerer Schritt)", group = "Darstellung")
+bool   showInfo = input.bool(true, "Infobox anzeigen", group = "Darstellung")
+
+int    rsiLen      = input.int(50,  "Order Accumulation: RSI-Laenge (Ticks)", minval = 2, group = "Parameter")
+int    sdCycle     = input.int(100, "Supply & Demand: Zykluslaenge (Ticks)", minval = 2, group = "Parameter")
+int    sdSumLen    = input.int(300, "Supply & Demand: Summenlaenge (Ticks)", minval = 2, group = "Parameter")
+bool   piReverse   = input.bool(true, "Price Inertia: Reverse (Original-Standard)", group = "Parameter")
+
+// ----------------------------------------------------------------------------
+// Zustand der Tick-Maschine (ein Objekt, pro Tick fortgeschrieben)
+// ----------------------------------------------------------------------------
+type TapeState
+    int   n = 0
+    float pc = na
+    float ph = na
+    float pl = na
+    int   pt = na
+    int   pday = na
+    // 7A Cash Flow
+    float meanRec = na
+    float rangeHi = na
+    float rangeLo = na
+    float rangeMean = na
+    float rangeValueSum = 0
+    float rangeVolSum = 0
+    float rangeVwap = na
+    float vwapDiff = 0
+    float breakEffect = 0
+    // 7B Volume Momentum
+    float lastDistinct = na
+    float prevDistinct = na
+    float boxMean = na
+    float vwapVolSum = 0
+    float vwapPriceSum = 0
+    float vwap1 = na
+    float vwapBarSum = 0
+    // 7C Order Accumulation
+    float netFast = 0
+    float totFast = 0
+    float netSlow = 0
+    float totSlow = 0
+    float rsiFast = 0
+    float rsiSlow = 0
+    float oaSum = 0
+    // 7D Supply & Demand
+    float chartVol = 0
+    int   lastTick = 0
+    array<float> demandBuf = na
+    float demandSum = 0
+    float cycA = na
+    float cycB = na
+    float demandA = 0
+    float demandB = 0
+    float sdSum = 0
+    // 7E/7F Transaction Sentiment, Market Orders
+    float marketOrders = 0
+    float vdirSum = 0
+    float vdSum1 = na
+    float vdSum2 = na
+    float dataUp = 0
+    float dataDn = 0
+    int   priceState = 1
+    float priceUp = 0
+    float priceDn = 0
+    float diffSum = 0
+    // 7G Order Speed
+    float upTime = 0
+    float dnTime = 0
+    // 7H Price Inertia
+    float dnMem = na
+    float upMem = na
+    float downSum = 0
+    float upSum = 0
+    float orderDiff = 0
+    // Ausgaben
+    float outCashFlow = na
+    float outVolMom = na
+    float outOrderAcc = na
+    float outSupDem = na
+    float outTransSent = na
+    float outMarketOrd = na
+    float outSpeed = na
+    float outInertia = na
+
+// Verarbeitet genau einen Tick (c, h, l, v, t in ms).
+method tick(TapeState s, float c, float h, float l, float v, int t) =>
+    bool  first = s.n == 0
+    float pc    = first ? c : s.pc
+    int   dt    = first ? 0 : t - s.pt
+    int   day   = int(math.floor(t / 86400000.0))
+    bool  newDay = first or day != s.pday
+    float tsz   = syminfo.mintick
+
+    // ---- 7A Cash Flow (Margin-To-Equity) ----------------------------------
+    float meanPrev = s.meanRec
+    float meanRec  = first ? c : (c != pc ? (c + pc) / 2 : s.meanRec)
+    float hi = s.rangeHi
+    float lo = s.rangeLo
+    int   gap = 0
+    if first
+        hi := c
+        lo := c
+    else if math.abs(c - pc) > tsz
+        if c > pc
+            gap := 1
+            hi := c
+            lo := c - tsz
+        else
+            gap := -1
+            hi := c + tsz
+            lo := c
+    else if meanRec != meanPrev
+        hi := meanRec + tsz / 2
+        lo := meanRec - tsz / 2
+    float rangeMean = (hi + lo) / 2
+    bool  changed   = first or rangeMean != s.rangeMean
+    float rvs   = changed ? v * rangeMean : v * c + s.rangeValueSum
+    float rvol  = changed ? v : v + s.rangeVolSum
+    float rvwap = rvol != 0 ? rvs / rvol : rangeMean
+    float vwapDiff = changed ? v * (rvwap - rangeMean) : s.vwapDiff + v * (rvwap - rangeMean)
+    float be = s.breakEffect
+    if not first and changed
+        float pm = s.rangeMean
+        float pv = s.rangeVwap
+        float pd = s.vwapDiff
+        if rangeMean > pm
+            if pv > pm
+                be := be + pd + v * tsz / 2
+            else if pv < pm
+                be := be - pd - v * tsz / 2
+        else
+            if pv > pm
+                be := be - pd + v * tsz / 2
+            else if pv < pm
+                be := be + pd - v * tsz / 2
+
+    // ---- 7B Volume Momentum (Box-VWAP) ------------------------------------
+    // Original nutzt einen Rueckwaerts-Indexer mit Blick in die Zukunft.
+    // Hier kausal: Wendepunkt der zuletzt unterschiedlichen Schlusskurse.
+    bool  pivot = false
+    float lastD = s.lastDistinct
+    float prevD = s.prevDistinct
+    if first
+        lastD := c
+    else if c != lastD
+        if not na(prevD) and (c - lastD) * (lastD - prevD) < 0
+            pivot := true
+        prevD := lastD
+        lastD := c
+    float boxMean    = first ? c : (pivot ? (c + prevD) / 2 : s.boxMean)
+    bool  boxChanged = first or boxMean != s.boxMean
+    float vvs   = boxChanged ? v : s.vwapVolSum + v
+    float vps   = boxChanged ? v * boxMean : s.vwapPriceSum + v * c
+    float vwap1 = vvs != 0 ? vps / vvs : boxMean
+    float vwapBarSum = first ? v * (vwap1 - boxMean) : s.vwapBarSum + v * (vwap1 - boxMean)
+
+    // ---- 7C Order Accumulation (MTF-RSI) ----------------------------------
+    float chg = first ? 0 : c - pc
+    float aF  = 2.0 / (rsiLen + 1)
+    float aS  = 2.0 / (rsiLen * 4 + 1)
+    float netF = first ? chg : s.netFast + aF * (chg - s.netFast)
+    float totF = first ? math.abs(chg) : s.totFast + aF * (math.abs(chg) - s.totFast)
+    float netS = first ? chg : s.netSlow + aS * (chg - s.netSlow)
+    float totS = first ? math.abs(chg) : s.totSlow + aS * (math.abs(chg) - s.totSlow)
+    float rsiF = totF != 0 ? 50 * netF / totF : 0
+    float rsiS = totS != 0 ? 50 * netS / totS : 0
+    float pF = s.rsiFast
+    float pS = s.rsiSlow
+    float score = rsiS > 0 and rsiF < 0 ? v :
+                  rsiS < 0 and rsiF > 0 ? -v :
+                  rsiS <= pS and rsiF > pF ? v :
+                  rsiS >= pS and rsiF < pF ? -v :
+                  rsiS > pS and rsiF > pF ? v :
+                  rsiS < pS and rsiF < pF ? -v : 0
+    float oaSum = s.oaSum + score
+
+    // ---- 7D Supply & Demand (Half-Cycler) ---------------------------------
+    float chartVol = newDay ? 1 : s.chartVol + 1
+    int   lastTick = c > pc ? 1 : c < pc ? -1 : s.lastTick
+    float timeW = newDay or dt == 0 ? 0 : v * dt
+    float term  = (lastTick == -1 ? v - 2 * timeW : 0) - (lastTick == 1 ? v - 2 * timeW : 0)
+    s.demandBuf.push(term)
+    float demandSum = s.demandSum + term
+    if s.demandBuf.size() > sdSumLen
+        demandSum -= s.demandBuf.shift()
+    float cyc  = sdCycle
+    float half = cyc / 2
+    float cycA = chartVol - cyc * math.floor(chartVol / cyc)
+    float cycB = (chartVol - half) - cyc * math.floor((chartVol - half) / cyc)
+    float demandA = (not first and cycA < s.cycA) ? demandSum : s.demandA + demandSum
+    float demandB = (not first and cycB < s.cycB) ? demandSum : s.demandB + demandSum
+    float frac   = (chartVol - half * math.floor(chartVol / half)) / half
+    float phased = (cycA >= cycB ? demandB : demandA) * frac + (cycA >= cycB ? demandA : demandB) * (1 - frac)
+    float sdSum  = first ? phased : s.sdSum + phased
+
+    // ---- 7F Market Orders / 7E Transaction Sentiment ----------------------
+    float vdir   = vwap1 > boxMean ? v : vwap1 < boxMean ? -v : 0
+    float longM  = not first and (rangeMean > s.rangeMean or gap == 1) ? v : 0
+    float shortM = not first and (rangeMean < s.rangeMean or gap == -1) ? v : 0
+    float marketOrders = s.marketOrders + longM - shortM
+    float vdirSum = s.vdirSum + (dt != 0 or c == pc ? 0 : vdir)
+    float vdSum   = marketOrders + vdirSum
+    // Original erkennt Pivots mit Blick auf den naechsten Tick; hier einen Tick spaeter.
+    bool  pivotPrev = not na(s.vdSum2) and (s.vdSum1 - vdSum) * (s.vdSum1 - s.vdSum2) > 0
+    float dUp = first or pivotPrev ? 0 : s.dataUp + (vdSum > s.vdSum1 ? v : 0)
+    float dDn = first or pivotPrev ? 0 : s.dataDn + (vdSum < s.vdSum1 ? v : 0)
+    bool  priceUp = not first and math.max(c, h) > math.max(pc, s.ph)
+    bool  priceDn = not first and math.min(c, l) < math.min(pc, s.pl)
+    int   ps  = s.priceState
+    float pUp = s.priceUp
+    float pDn = s.priceDn
+    if priceUp
+        ps := 1
+        pUp := s.priceState == -1 ? v : pUp + v
+        pDn := 0
+    else if priceDn
+        ps := -1
+        pDn := s.priceState == 1 ? v : pDn + v
+        pUp := 0
+    else
+        pDn += s.priceState == -1 ? v : 0
+        pUp += s.priceState == 1 ? v : 0
+    float diffSum = s.diffSum + (pUp - pDn) + (dUp - dDn)
+
+    // ---- 7G Order Speed ---------------------------------------------------
+    float upTime = s.upTime + (ps == 1 ? dt : 0)
+    float dnTime = s.dnTime + (ps == 1 ? 0 : dt)
+
+    // ---- 7H Price Inertia -------------------------------------------------
+    float dnMem = first or c < pc ? c : s.dnMem
+    float upMem = first or c > pc ? c : s.upMem
+    float downSum = first ? v : (c != dnMem ? math.max(s.downSum - v, 0) : (dnMem != s.dnMem ? v : s.downSum + v))
+    float upSum   = first ? v : (c != upMem ? math.max(s.upSum - v, 0) : (upMem != s.upMem ? v : s.upSum + v))
+    float ud = upSum - downSum
+    float orderDiff = first ? ud : s.orderDiff + (piReverse and dt != 0 ? -ud : ud)
+
+    // ---- Zustand fortschreiben --------------------------------------------
+    s.meanRec := meanRec
+    s.rangeHi := hi
+    s.rangeLo := lo
+    s.rangeMean := rangeMean
+    s.rangeValueSum := rvs
+    s.rangeVolSum := rvol
+    s.rangeVwap := rvwap
+    s.vwapDiff := vwapDiff
+    s.breakEffect := be
+    s.lastDistinct := lastD
+    s.prevDistinct := prevD
+    s.boxMean := boxMean
+    s.vwapVolSum := vvs
+    s.vwapPriceSum := vps
+    s.vwap1 := vwap1
+    s.vwapBarSum := vwapBarSum
+    s.netFast := netF
+    s.totFast := totF
+    s.netSlow := netS
+    s.totSlow := totS
+    s.rsiFast := rsiF
+    s.rsiSlow := rsiS
+    s.oaSum := oaSum
+    s.chartVol := chartVol
+    s.lastTick := lastTick
+    s.demandSum := demandSum
+    s.cycA := cycA
+    s.cycB := cycB
+    s.demandA := demandA
+    s.demandB := demandB
+    s.sdSum := sdSum
+    s.marketOrders := marketOrders
+    s.vdirSum := vdirSum
+    s.vdSum2 := s.vdSum1
+    s.vdSum1 := vdSum
+    s.dataUp := dUp
+    s.dataDn := dDn
+    s.priceState := ps
+    s.priceUp := pUp
+    s.priceDn := pDn
+    s.diffSum := diffSum
+    s.upTime := upTime
+    s.dnTime := dnTime
+    s.dnMem := dnMem
+    s.upMem := upMem
+    s.downSum := downSum
+    s.upSum := upSum
+    s.orderDiff := orderDiff
+    s.pc := c
+    s.ph := h
+    s.pl := l
+    s.pt := t
+    s.pday := day
+    s.n := s.n + 1
+
+    s.outCashFlow  := be + vwapDiff
+    s.outVolMom    := vwapBarSum
+    s.outOrderAcc  := oaSum
+    s.outSupDem    := sdSum
+    s.outTransSent := diffSum + vdSum
+    s.outMarketOrd := marketOrders
+    s.outSpeed     := upTime - dnTime
+    s.outInertia   := orderDiff
+    s.n
+
+method value(TapeState s, string name) =>
+    switch name
+        A_CF => s.outCashFlow
+        A_VM => s.outVolMom
+        A_OA => s.outOrderAcc
+        A_SD => s.outSupDem
+        A_TS => s.outTransSent
+        A_MO => s.outMarketOrd
+        A_OS => s.outSpeed
+        A_PI => s.outInertia
+        => na
+
+algoColor(string name) =>
+    switch name
+        A_VM => color.rgb(255, 190, 110)
+        A_OA => color.rgb(140, 230, 140)
+        A_CF => color.rgb(0, 220, 255)
+        A_SD => color.rgb(240, 240, 240)
+        A_TS => color.rgb(220, 90, 90)
+        A_MO => color.rgb(150, 150, 220)
+        A_OS => color.rgb(255, 150, 200)
+        A_PI => color.rgb(190, 190, 190)
+        => color.gray
+
+// ----------------------------------------------------------------------------
+// Datenquelle
+// ----------------------------------------------------------------------------
+bool chartIsTicks = str.endswith(timeframe.period, "T")
+
+array<float> ic = request.security_lower_tf(syminfo.tickerid, ltf, close,  ignore_invalid_timeframe = true)
+array<float> ih = request.security_lower_tf(syminfo.tickerid, ltf, high,   ignore_invalid_timeframe = true)
+array<float> il = request.security_lower_tf(syminfo.tickerid, ltf, low,    ignore_invalid_timeframe = true)
+array<float> iv = request.security_lower_tf(syminfo.tickerid, ltf, volume, ignore_invalid_timeframe = true)
+array<int>   it = request.security_lower_tf(syminfo.tickerid, ltf, time,   ignore_invalid_timeframe = true)
+
+bool haveIntrabars = not chartIsTicks and ic.size() > 0 and ic.size() == it.size()
+bool useChartBars  = dataMode == M_CHART or (dataMode == M_AUTO and (chartIsTicks or not haveIntrabars))
+bool useIntrabars  = not useChartBars and haveIntrabars
+
+var TapeState st = TapeState.new(demandBuf = array.new<float>())
+
+if useChartBars
+    st.tick(close, high, low, nz(volume), time)
+else if useIntrabars
+    for i = 0 to ic.size() - 1
+        st.tick(ic.get(i), ih.get(i), il.get(i), nz(iv.get(i)), it.get(i))
+
+float raw1 = algo1 == A_OFF ? na : st.value(algo1)
+float raw2 = algo2 == A_OFF ? na : st.value(algo2)
+
+// ----------------------------------------------------------------------------
+// Ausreisser-Filter (Abschnitt 10): Schritt begrenzt auf 3x mittleren |Schritt|
+// Original nutzt den Mittelwert ueber den ganzen Chart (HighestAll), hier laufend.
+// ----------------------------------------------------------------------------
+stepFilter(float raw) =>
+    var float filt = 0.0
+    var float sumAbs = 0.0
+    var int   cnt = 0
+    float prev = raw[1]
+    float step = na(raw) or na(prev) ? 0.0 : raw - prev
+    if step != 0
+        sumAbs += math.abs(step)
+        cnt += 1
+    float avg = cnt > 0 ? sumAbs / cnt : na
+    float lim = na(avg) or avg == 0 ? 1.0 : math.max(math.abs(step) / (3 * avg), 1.0)
+    filt += step / lim
+    na(raw) ? na : filt
+
+float sf1 = stepFilter(raw1)
+float sf2 = stepFilter(raw2)
+float f1 = useStep ? sf1 : raw1
+float f2 = useStep ? sf2 : raw2
+
+// ----------------------------------------------------------------------------
+// Normierung auf -1..+1 (Original: ((x-H)+(x-L))/(H-L))
+// ----------------------------------------------------------------------------
+float h1 = scaling == S_RECENT ? ta.highest(f1, visLen) : ta.max(f1)
+float l1 = scaling == S_RECENT ? ta.lowest(f1, visLen)  : ta.min(f1)
+float h2 = scaling == S_RECENT ? ta.highest(f2, visLen) : ta.max(f2)
+float l2 = scaling == S_RECENT ? ta.lowest(f2, visLen)  : ta.min(f2)
+float n1 = na(f1) or h1 - l1 == 0 ? na : ((f1 - h1) + (f1 - l1)) / (h1 - l1)
+float n2 = na(f2) or h2 - l2 == 0 ? na : ((f2 - h2) + (f2 - l2)) / (h2 - l2)
+
+// ----------------------------------------------------------------------------
+// Darstellung
+// ----------------------------------------------------------------------------
+plot(n1, "Algorithmus 1", color = algoColor(algo1), linewidth = 2)
+plot(n2, "Algorithmus 2", color = algoColor(algo2), linewidth = 1)
+hline(0,  "Null",  color = color.new(color.gray, 20))
+hline(1,  "Oben",  color = color.new(color.gray, 70), linestyle = hline.style_dotted)
+hline(-1, "Unten", color = color.new(color.gray, 70), linestyle = hline.style_dotted)
+bgcolor(not useChartBars and not useIntrabars ? color.new(color.red, 92) : na, title = "Keine Daten")
+
+var table info = table.new(position.top_right, 2, 5, border_width = 1)
+if showInfo and barstate.islast
+    string mode = useChartBars ? (chartIsTicks ? "Tick-Chart (" + timeframe.period + ")" : "Chart-Bars als Ticks (grob)") :
+                  useIntrabars ? "Intrabars " + ltf + " (Naeherung)" : "keine Intrabar-Daten"
+    color modeCol = chartIsTicks ? color.rgb(140, 230, 140) : useIntrabars ? color.rgb(255, 190, 110) : color.rgb(220, 90, 90)
+    table.cell(info, 0, 0, "Tape Volume", text_color = color.white, bgcolor = color.new(color.black, 30))
+    table.cell(info, 1, 0, syminfo.ticker, text_color = color.white, bgcolor = color.new(color.black, 30))
+    table.cell(info, 0, 1, "Daten", text_color = color.white, bgcolor = color.new(color.black, 50))
+    table.cell(info, 1, 1, mode, text_color = modeCol, bgcolor = color.new(color.black, 50))
+    table.cell(info, 0, 2, "Algo 1", text_color = algoColor(algo1), bgcolor = color.new(color.black, 50))
+    table.cell(info, 1, 2, algo1 + (na(n1) ? "" : "  " + str.tostring(n1, "#.00")), text_color = algoColor(algo1), bgcolor = color.new(color.black, 50))
+    table.cell(info, 0, 3, "Algo 2", text_color = algoColor(algo2), bgcolor = color.new(color.black, 50))
+    table.cell(info, 1, 3, algo2 + (na(n2) ? "" : "  " + str.tostring(n2, "#.00")), text_color = algoColor(algo2), bgcolor = color.new(color.black, 50))
+    table.cell(info, 0, 4, "Ticks", text_color = color.white, bgcolor = color.new(color.black, 50))
+    table.cell(info, 1, 4, str.tostring(st.n), text_color = color.white, bgcolor = color.new(color.black, 50))
+
+alertcondition(ta.crossover(n1, 0),  "Algo 1 kreuzt Null nach oben", "Tape Volume: Algorithmus 1 ueber Null")
+alertcondition(ta.crossunder(n1, 0), "Algo 1 kreuzt Null nach unten", "Tape Volume: Algorithmus 1 unter Null")
